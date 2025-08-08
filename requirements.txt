@@ -1,0 +1,6 @@
+kafka-python
+requests
+pymysql
+apache-airflow-providers-apache-kafka
+apache-airflow-providers-mysql
+# Add any other specific libraries your DAGs require below

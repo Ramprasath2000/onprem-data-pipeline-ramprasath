@@ -1,0 +1,17 @@
+FROM apache/airflow:2.9.1-python3.8
+
+USER root
+# (Optional) install OS-level dependencies if you need any
+# RUN apt-get update && apt-get install -y <package>
+RUN apt-get update && apt-get install -y docker.io
+USER airflow
+
+# Install all Python dependencies as airflow user
+COPY requirements.txt /
+RUN pip install --no-cache-dir -r /requirements.txt
+
+# Copy DAGs and any additional project files
+COPY ./dags /opt/airflow/dags
+COPY ./plugins /opt/airflow/plugins
+COPY ./spark_jobs /opt/airflow/spark_jobs
+COPY ./kafka_producer /opt/airflow/kafka_producer

@@ -1,0 +1,199 @@
+hive modification:
+
+version: "3.8"
+
+services:
+  # ---- Messaging Layer ----
+  zookeeper:
+    image: confluentinc/cp-zookeeper:6.2.0
+    ports:
+      - "2181:2181"
+    environment: 
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+
+  kafka:
+    image: confluentinc/cp-kafka:6.2.0
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      ZOOKEEPER_TICK_TIME: 2000
+    depends_on:
+      - zookeeper
+
+  # ---- Database Layer ----
+  mysql:
+    image: mysql:8
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: sensor_data
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  # ---- Data Generators & ETL ----
+  kafka_producer:
+    build: ./kafka_producer
+    environment:
+      - OPENWEATHER_API_KEY=daf96e440dba778ebbd8522cc06f7c1f
+      - KAFKA_BROKER=kafka:9092
+      - KAFKA_TOPIC=weather-topic
+      - WEATHER_CITY=Chennai
+    depends_on:
+      - kafka
+    restart: unless-stopped
+
+  faker_csv:
+    build: ./faker_csv
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
+
+  mysql_inserter:
+    build: ./mysql_inserter
+    environment:
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=rootpassword
+      - MYSQL_DB=sensor_data
+    depends_on:
+      - mysql
+    restart: unless-stopped
+
+  # ---- Apache Spark (Standalone Cluster) ----
+  spark-master:
+    image: bitnami/spark:3.5.0
+    environment:
+      - SPARK_MODE=master
+    ports:
+      - "7077:7077"  # Spark master port
+      - "8080:8080"  # Spark master UI
+    volumes:
+      - ./spark_jobs:/app
+      - ./data:/data
+      - ./hive-conf/hive-site.xml:/opt/bitnami/spark/conf/hive-site.xml:ro
+
+  spark-worker-1:
+    image: bitnami/spark:3.5.0
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+    depends_on:
+      - spark-master
+    ports:
+      - "8081:8081"  # Worker web UI
+    volumes:
+      - ./spark_jobs:/app
+      - ./data:/data
+      - ./hive-conf/hive-site.xml:/opt/bitnami/spark/conf/hive-site.xml:ro
+  
+  spark-streamer:
+      image: bitnami/spark:3.5.0
+      depends_on:
+        - spark-master
+        - kafka
+      volumes:
+        - ./spark_jobs:/app
+        - ./data:/data
+      environment:
+        - KAFKA_BROKER=kafka:9092
+        - KAFKA_TOPIC=weather-topic
+        - CHECKPOINT_DIR=/data/chkpt/
+        - PARQUET_OUTPUT_DIR=/data/parquet/
+      command: >
+        spark-submit
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0
+        --master spark://spark-master:7077
+        /app/streaming_kafka_to_parquet.py
+      restart: unless-stopped
+
+
+  # ---- Hive Metastore (Embedded Derby DB for dev) ----
+  hive-metastore:
+    image: loum/hive-on-spark:3.1.2-2.4.8-2
+    environment:
+      - HIVE_METASTORE_DATABASE_HOST=mysql
+      - HIVE_METASTORE_DATABASE_PORT=3306
+      - HIVE_METASTORE_DATABASE_NAME=metastore_db
+      - HIVE_METASTORE_DATABASE_USER=root
+      - HIVE_METASTORE_DATABASE_PASSWORD=rootpassword
+    depends_on:
+      - mysql
+    ports:
+      - "9083:9083"  # Hive metastore thrift
+    volumes:
+      - hive_data:/bitnami/hive
+
+  # ---- Airflow Orchestration ----
+  airflow-webserver:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: 'V5KuQooeoFrmL-hlXMzjVphtbQ4WWvYPPLLEZ0jcN0k='
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: 'mysql+pymysql://root:rootpassword@mysql:3306/airflow'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'uohVNmkmMfgMEIdD7mKaTQ'
+    ports:
+      - "8082:8080"
+    command: "webserver"
+    depends_on:
+      - mysql
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./plugins:/opt/airflow/plugins
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./kafka_producer:/opt/airflow/kafka_producer
+      - /var/run/docker.sock:/var/run/docker.sock      
+    restart: always
+
+  airflow-scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: 'V5KuQooeoFrmL-hlXMzjVphtbQ4WWvYPPLLEZ0jcN0k='
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: 'mysql+pymysql://root:rootpassword@mysql:3306/airflow'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'uohVNmkmMfgMEIdD7mKaTQ'
+    command: "scheduler"
+    depends_on:
+      - mysql
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./plugins:/opt/airflow/plugins
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./kafka_producer:/opt/airflow/kafka_producer
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+
+  airflow-init:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__FERNET_KEY: 'V5KuQooeoFrmL-hlXMzjVphtbQ4WWvYPPLLEZ0jcN0k='
+      AIRFLOW__CORE__SQL_ALCHEMY_CONN: 'mysql+pymysql://root:rootpassword@mysql:3306/airflow'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'uohVNmkmMfgMEIdD7mKaTQ'
+    command: "db init"
+    depends_on:
+      - mysql
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./plugins:/opt/airflow/plugins
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./kafka_producer:/opt/airflow/kafka_producer
+
+volumes:
+  mysql_data:
+  hive_data:
